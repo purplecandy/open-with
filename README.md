@@ -61,12 +61,32 @@ menu.
 ## Install
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/purplecandy/open-with/main/install.sh | bash
+```
+
+That downloads the script, checks it is intact, and puts it in `/usr/local/bin`
+if you can write there, otherwise `~/.local/bin` (and tells you if that is not
+on your `PATH`). Run it again to update. No `sudo` is ever asked for.
+
+To choose the location yourself:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/purplecandy/open-with/main/install.sh \
+  | OPEN_WITH_INSTALL_DIR=~/bin bash
+```
+
+Prefer to do it by hand? It is a single file, so:
+
+```sh
 curl -fsSL -o /usr/local/bin/open-with \
   https://raw.githubusercontent.com/purplecandy/open-with/main/open-with
 chmod +x /usr/local/bin/open-with
 ```
 
 Or just drop the file anywhere on your `PATH`.
+
+Uninstall: `rm "$(command -v open-with)"`. The change log lives at
+`~/.local/state/open-with/` if you want that gone too.
 
 ## Types
 

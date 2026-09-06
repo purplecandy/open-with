@@ -13,4 +13,4 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: Lint
-        run: shellcheck -s bash -S warning open-with
+        run: shellcheck -s bash -S warning open-with install.sh

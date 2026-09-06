@@ -1,154 +1,98 @@
 # open-with
 
-Set the default macOS application for file types, from the terminal.
+Choose which app opens a kind of file on your Mac. One line in the Terminal.
 
-```sh
-open-with md json -w Zed      # Markdown and JSON now open in Zed
-open-with @images -w Preview  # every common image type, in one go
-open-with                     # pick types, then pick an app
-open-with -l                  # what opens what right now?
-open-with history             # everything it has changed
-open-with undo last           # put it back
-open-with --doctor            # clean up ghost app registrations
-```
-
-No Homebrew, no `duti`, no compiler, no `sudo`. One file of bash.
-
-## No dependencies
-
-It drives LaunchServices through Apple's current APIs — `NSWorkspace` and
-`UTType` — via the JavaScript-for-Automation ObjC bridge that ships with every
-Mac, and shells out to Apple's own `lsregister` for cleanup.
-
-Everything it calls is part of macOS: `/bin/bash` (works on the stock 3.2),
-`osascript`, and base BSD userland. Verified under `env -i` with Homebrew off
-`PATH`. Needs macOS 12 (Monterey) or later.
-
-`fzf` is used for the pickers if you have it; otherwise you get a numbered
-menu.
+![open-with demo](demo.gif)
 
 ## Install
+
+Paste this into Terminal and press Enter:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/purplecandy/open-with/main/install.sh | bash
 ```
 
-That downloads the script, checks it is intact, and puts it in `/usr/local/bin`
-if you can write there, otherwise `~/.local/bin` (and tells you if that is not
-on your `PATH`). Run it again to update. No `sudo` is ever asked for.
+That is all. It needs macOS 12 or newer and nothing else. Run the same line
+again to update.
 
-To choose the location yourself:
+## Use it
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/purplecandy/open-with/main/install.sh \
-  | OPEN_WITH_INSTALL_DIR=~/bin bash
-```
-
-Prefer to do it by hand? It is a single file, so:
+Open all Markdown and JSON files in Zed:
 
 ```sh
-curl -fsSL -o /usr/local/bin/open-with \
-  https://raw.githubusercontent.com/purplecandy/open-with/main/open-with
-chmod +x /usr/local/bin/open-with
+open-with md json -w Zed
 ```
 
-Or just drop the file anywhere on your `PATH`.
+Open every kind of image in Preview:
 
-Uninstall: `rm "$(command -v open-with)"`. The change log lives at
-`~/.local/state/open-with/` if you want that gone too.
-
-## Types
-
-A type can be written however you happen to think of it:
-
-| Form | Example |
-|---|---|
-| extension | `md`, `.md`, `'*.md'` |
-| MIME type | `text/markdown` |
-| UTI | `net.daringfireball.markdown` |
-| an actual file | `~/notes/todo.md` |
-| a group | `@images`, `@code`, `@media` |
-
-Extensions macOS has no registered type for (`.mdx`, `.astro`, `.envrc`) still
-work — they get a dynamic identifier, which is exactly what Finder's
-*Get Info → Change All…* does.
-
-The interactive picker lists about 130 common types. Anything not in that list
-can be typed into the picker, or passed on the command line as usual.
-
-Passing a real file uses its extension, and says so before it changes anything:
-
+```sh
+open-with @images -w Preview
 ```
-$ open-with ~/notes/report.md -w Zed
-Set Zed as the default for:
-  md         Markdown Text                TextEdit → Zed
 
-  Note: this applies to every .md file, not just report.md.
-  To open one file once, use: open -a Zed report.md
+Not sure what to type? Run it with nothing. It will ask you:
+
+```sh
+open-with
+```
+
+See what opens what right now:
+
+```sh
+open-with -l
+```
+
+Changed your mind? Put it back:
+
+```sh
+open-with undo last
 ```
 
 ## Groups
 
-A `@group` stands for a set of extensions, so one word covers a whole category:
+Put `@` in front of a word to mean a whole set of file types.
+
+| Group | What it covers |
+|---|---|
+| `@text` | txt, md, log, ... |
+| `@docs` | pdf, doc, docx, xls, ppt, ... |
+| `@data` | json, yaml, xml, csv, ... |
+| `@code` | py, go, rs, java, sh, ... |
+| `@web` | html, css, js, ts, ... |
+| `@images` | png, jpg, gif, heic, ... |
+| `@audio` | mp3, wav, flac, ... |
+| `@video` | mp4, mov, mkv, ... |
+| `@archives` | zip, tar, gz, dmg, ... |
+| `@media` | images, audio and video together |
+
+`open-with --groups` shows the full list.
+
+## When an app "cannot be opened"
+
+Sometimes macOS says an app was moved to the Trash when it is right there in
+your Applications folder. Old, broken records cause this. This cleans them up:
 
 ```sh
-open-with @images -w Preview
-open-with @code @web @data -w Zed
-open-with -l @audio
+open-with --doctor
 ```
-
-| Group | Covers |
-|---|---|
-| `@text` (`@txt`) | txt, md, markdown, mdx, rst, adoc, org, tex, log, ... |
-| `@docs` | pdf, epub, rtf, doc, docx, odt, ppt, pptx, xls, xlsx, ... |
-| `@data` | json, yaml, toml, xml, csv, tsv, plist, ini, conf, env, sql, ... |
-| `@code` | py, rb, go, rs, java, kt, swift, c, cpp, sh, zsh, lua, php, ... |
-| `@web` | html, css, scss, js, ts, jsx, tsx, vue, svelte, astro, svg, ... |
-| `@images` (`@img`) | png, jpg, jpeg, gif, webp, heic, avif, tiff, bmp, svg, psd, ... |
-| `@audio` | mp3, wav, flac, aac, m4a, ogg, opus, aiff, ... |
-| `@video` | mp4, mov, mkv, avi, webm, m4v, ... |
-| `@archives` (`@zip`) | zip, tar, gz, tgz, bz2, xz, 7z, rar, dmg, iso, pkg, ... |
-| `@media` | everything in `@images`, `@audio` and `@video` |
-
-`open-with --groups` prints the full membership. The `@` is what keeps
-`open-with zip` (the `.zip` extension) distinct from `open-with @zip` (every
-archive type).
 
 ## Options
 
 ```
--w, --with APP     application: name, path, or bundle id
--l, --list         show current handlers
-    --groups       list the @groups and what is in them
--a, --all-apps     list every app, not just capable ones
--d, --doctor       find and remove stale registrations
-    --history      list every change this tool has made
-    --undo [N]     revert a change
--n, --dry-run      show what would change, change nothing
--y, --yes          skip confirmation
--q, --quiet        suppress notes and warnings
+-w, --with APP     the app to use
+-l, --list         show what opens what
+    --groups       show the @groups
+-d, --doctor       clean up broken app records
+    --history      show every change made by this tool
+    --undo [N]     take a change back
+-n, --dry-run      show what would change, but change nothing
+-y, --yes          do not ask before changing
 -h, --help         full help
 ```
 
-## Caveats
+## More
 
-- `--doctor` treats any registered app whose path does not currently exist as
-  stale. An app on an external drive that is unplugged right now fits that
-  description too. Unregistering it is harmless - macOS re-registers it the
-  next time it launches - but you may want to plug the drive in first.
-- Finder caches handlers per session. If a change does not appear to take,
-  relaunch Finder or log out and back in.
-- `.ts` resolves to MPEG-2 Transport Stream, not TypeScript — macOS's opinion,
-  not this script's. The picker shows you the resolved type before it commits,
-  so you can see it coming.
-- The `UniformTypeIdentifiers` framework has no bridge metadata, so
-  JavaScript-for-Automation cannot `import` it. The script reaches the `UTType`
-  class through the ObjC runtime instead, which works because AppKit already
-  loads the framework.
-- Setting a handler goes through NSWorkspace's asynchronous API, whose
-  completion callback JXA cannot receive. The script pumps the run loop and
-  waits up to three seconds for the change to become visible, then reports
-  success or failure from what it reads back. Tested on Sequoia (macOS 15).
+How it works, all the ways to name a type, and known quirks:
+[DETAILS.md](DETAILS.md)
 
 ## License
 

@@ -258,56 +258,80 @@ HELPDOC
 
 # --------------------------------------------------------- LaunchServices glue
 #
-# One osascript process per call, so every verb takes a batch of arguments.
-# Fields are tab separated.
+# Uses NSWorkspace and UTType, the current (non-deprecated) way to talk to
+# LaunchServices. One osascript process per call, so every verb takes a batch
+# of arguments. Fields are tab separated.
 
 jxa() {
   osascript -l JavaScript - "$@" <<'JXA_EOF'
-ObjC.import('CoreServices');
 ObjC.import('AppKit');
 
-var ALL = 0xFFFFFFFF;
-var ws  = $.NSWorkspace.sharedWorkspace;
+// UniformTypeIdentifiers ships no bridge metadata, so ObjC.import() cannot see
+// it. AppKit already loads the framework, so ask the runtime for the class.
+var UTType = $.NSClassFromString('UTType');
+var ws     = $.NSWorkspace.sharedWorkspace;
 
-// CoreServices returns CFStringRef, which JXA hands back as an untyped Ref.
-function cf(ref) {
-  try {
-    var o = ObjC.castRefToObject(ref);
-    return (o && o.js !== undefined) ? o.js : null;
-  } catch (e) { return null; }
+function tabsafe(v) { return String(v == null ? '' : v).replace(/[\t\n]/g, ' '); }
+
+// Optional NSString -> JS string or null.
+function str(nsstr) { return (nsstr && nsstr.js !== undefined) ? nsstr.js : null; }
+
+function bundleId(url) {
+  var b = $.NSBundle.bundleWithURL(url);
+  return (b.js === undefined) ? null : str(b.bundleIdentifier);
 }
 
-function tabsafe(v) { return String(v === null ? '' : v).replace(/[\t\n]/g, ' '); }
-
 function appInfo(bid) {
-  var url = ws.URLForApplicationWithBundleIdentifier($(bid));
+  var url = ws.URLForApplicationWithBundleIdentifier(bid);
   if (url.js === undefined) return { bid: bid, name: bid, path: '' };
   var path = url.path.js;
   return { bid: bid, name: path.split('/').pop().replace(/\.app$/, ''), path: path };
 }
 
-// A token is a MIME type, a UTI, or a bare filename extension.
-function resolveType(tok) {
-  if (tok.indexOf('/') >= 0) {
-    return { uti: cf($.UTTypeCreatePreferredIdentifierForTag($.kUTTagClassMIMEType, $(tok), $())), how: 'mime' };
-  }
-  // Looks like a UTI only if the system actually knows it; that keeps
-  // things like "tar.gz" from being mistaken for one.
-  if (tok.indexOf('.') >= 0 && (tok.indexOf('dyn.') === 0 || $.UTTypeIsDeclared($(tok)))) {
-    return { uti: tok, how: 'uti' };
-  }
-  return { uti: cf($.UTTypeCreatePreferredIdentifierForTag($.kUTTagClassFilenameExtension, $(tok), $())), how: 'ext' };
+// Current default handler for a type, as a bundle id, or null.
+function handlerFor(type) {
+  var url = ws.URLForApplicationToOpenContentType(type);
+  return url.js === undefined ? null : bundleId(url);
 }
 
+// Every app that can open a type, as bundle ids.
+function handlersFor(type) {
+  var urls = ws.URLsForApplicationsToOpenContentType(type), out = [];
+  for (var i = 0; i < urls.count; i++) {
+    var b = bundleId(urls.objectAtIndex(i));
+    if (b) out.push(b);
+  }
+  return out;
+}
+
+// A token is a MIME type, a UTI, or a bare filename extension. Returns a
+// UTType (or null) plus which reading was used.
+function resolveType(tok) {
+  var t;
+  if (tok.indexOf('/') >= 0) {
+    t = UTType.typeWithMIMEType(tok);
+    return { type: t.js === undefined ? null : t, how: 'mime' };
+  }
+  // Only a UTI if the system knows it; that keeps "tar.gz" from being mistaken
+  // for one. Dynamic identifiers (dyn.*) are known once they have been minted.
+  if (tok.indexOf('.') >= 0) {
+    t = UTType.typeWithIdentifier(tok);
+    if (t.js !== undefined) return { type: t, how: 'uti' };
+  }
+  t = UTType.typeWithFilenameExtension(tok);
+  return { type: t.js === undefined ? null : t, how: 'ext' };
+}
+
+// token  uti  how  declared  description  current_bundle_id  current_app_name
 function verbResolve(args) {
   return args.map(function (tok) {
     var r = resolveType(tok);
-    if (!r.uti) return [tok, '', r.how, '0', '', '', ''].map(tabsafe).join('\t');
-    var declared = $.UTTypeIsDeclared($(r.uti)) && r.uti.indexOf('dyn.') !== 0;
-    var desc = cf($.UTTypeCopyDescription($(r.uti))) || '';
-    var cur = cf($.LSCopyDefaultRoleHandlerForContentType($(r.uti), ALL));
-    var curName = cur ? appInfo(cur).name : '';
-    return [tok, r.uti, r.how, declared ? '1' : '0', desc, cur || '', curName].map(tabsafe).join('\t');
+    if (!r.type) return [tok, '', r.how, '0', '', '', ''].map(tabsafe).join('\t');
+    var declared = r.type.isDeclared && !r.type.isDynamic;
+    var cur = handlerFor(r.type);
+    return [tok, r.type.identifier.js, r.how, declared ? '1' : '0',
+            str(r.type.localizedDescription), cur, cur ? appInfo(cur).name : '']
+      .map(tabsafe).join('\t');
   }).join('\n');
 }
 
@@ -315,13 +339,12 @@ function verbResolve(args) {
 function verbCandidates(utis) {
   var score = {}, order = [];
   utis.forEach(function (uti) {
-    var list = ObjC.castRefToObject($.LSCopyAllRoleHandlersForContentType($(uti), ALL));
-    if (!list || list.count === undefined) return;
-    for (var i = 0; i < list.count; i++) {
-      var bid = list.objectAtIndex(i).js;
+    var type = UTType.typeWithIdentifier(uti);
+    if (type.js === undefined) return;
+    handlersFor(type).forEach(function (bid) {
       if (score[bid] === undefined) { score[bid] = 0; order.push(bid); }
       score[bid]++;
-    }
+    });
   });
   return order
     .map(function (bid) { var a = appInfo(bid); a.n = score[bid]; return a; })
@@ -338,16 +361,14 @@ function verbApps() {
               $.NSHomeDirectory().js + '/Applications'];
   var seen = {}, out = [];
   dirs.forEach(function (dir) {
-    var items = fm.contentsOfDirectoryAtPathError($(dir), $());
+    var items = fm.contentsOfDirectoryAtPathError(dir, $());
     if (items.js === undefined) return;
     for (var i = 0; i < items.count; i++) {
       var name = items.objectAtIndex(i).js;
       if (!/\.app$/.test(name)) continue;
       var path = dir + '/' + name;
-      var b = $.NSBundle.bundleWithPath($(path));
-      if (b.js === undefined || b.bundleIdentifier.js === undefined) continue;
-      var bid = b.bundleIdentifier.js;
-      if (seen[bid]) continue;
+      var bid = bundleId($.NSURL.fileURLWithPath(path));
+      if (!bid || seen[bid]) continue;
       seen[bid] = true;
       out.push(['1', bid, name.replace(/\.app$/, ''), path].map(tabsafe).join('\t'));
     }
@@ -359,15 +380,15 @@ function verbApps() {
 function verbApp(query) {
   var tries = [];
   if (/\.app\/?$/.test(query)) {
-    var b = $.NSBundle.bundleWithPath($(query.replace(/\/$/, '')));
-    if (b.js !== undefined && b.bundleIdentifier.js !== undefined) tries.push(b.bundleIdentifier.js);
+    var b = bundleId($.NSURL.fileURLWithPath(query.replace(/\/$/, '')));
+    if (b) tries.push(b);
   }
-  var byName = ws.fullPathForApplication($(query.replace(/\.app$/, '')));
+  var byName = ws.fullPathForApplication(query.replace(/\.app$/, ''));
   if (byName.js !== undefined) {
-    var nb = $.NSBundle.bundleWithPath(byName);
-    if (nb.js !== undefined && nb.bundleIdentifier.js !== undefined) tries.push(nb.bundleIdentifier.js);
+    var nb = bundleId($.NSURL.fileURLWithPath(byName.js));
+    if (nb) tries.push(nb);
   }
-  if (ws.URLForApplicationWithBundleIdentifier($(query)).js !== undefined) tries.push(query);
+  if (ws.URLForApplicationWithBundleIdentifier(query).js !== undefined) tries.push(query);
 
   for (var i = 0; i < tries.length; i++) {
     var a = appInfo(tries[i]);
@@ -376,13 +397,25 @@ function verbApp(query) {
   return '';
 }
 
+// uti  ok|fail  current_bundle_id
+//
+// NSWorkspace's setter is asynchronous and reports through a completion block,
+// which JXA cannot receive. So: fire it, pump the run loop until the change is
+// visible, and give up after a few seconds.
 function verbSet(args) {
   var bid = args.shift();
+  var app = ws.URLForApplicationWithBundleIdentifier(bid);
   return args.map(function (uti) {
-    var st = $.LSSetDefaultRoleHandlerForContentType($(uti), ALL, $(bid));
-    var now = cf($.LSCopyDefaultRoleHandlerForContentType($(uti), ALL));
-    var ok = (st === 0 && now === bid);
-    return [uti, ok ? 'ok' : 'fail', st, now || ''].map(tabsafe).join('\t');
+    var type = UTType.typeWithIdentifier(uti);
+    if (app.js === undefined || type.js === undefined) return [uti, 'fail', ''].join('\t');
+
+    ws.setDefaultApplicationAtURLToOpenContentTypeCompletionHandler(app, type, $());
+    var now = handlerFor(type), deadline = Date.now() + 3000;
+    while (now !== bid && Date.now() < deadline) {
+      $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.02));
+      now = handlerFor(type);
+    }
+    return [uti, now === bid ? 'ok' : 'fail', now].map(tabsafe).join('\t');
   }).join('\n');
 }
 
@@ -390,66 +423,9 @@ function verbSet(args) {
 function verbDeclares(args) {
   var bid = args.shift();
   return args.map(function (uti) {
-    var list = ObjC.castRefToObject($.LSCopyAllRoleHandlersForContentType($(uti), ALL));
-    var yes = false;
-    if (list && list.count !== undefined) {
-      for (var i = 0; i < list.count && !yes; i++) yes = (list.objectAtIndex(i).js === bid);
-    }
+    var type = UTType.typeWithIdentifier(uti);
+    var yes = type.js !== undefined && handlersFor(type).indexOf(bid) >= 0;
     return [uti, yes ? '1' : '0'].join('\t');
-  }).join('\n');
-}
-
-// Broad-to-narrow: the first match wins, so specific buckets come first.
-var GROUPS = [
-  ['public.archive', 'Archive'], ['public.image', 'Image'],
-  ['public.movie', 'Video'], ['public.audio', 'Audio'],
-  ['public.font', 'Font'], ['public.source-code', 'Code'],
-  ['public.spreadsheet', 'Docs'], ['public.presentation', 'Docs'],
-  ['com.adobe.pdf', 'Docs'], ['public.composite-content', 'Docs'],
-  ['public.text', 'Text'], ['public.data', 'Data']
-];
-var GROUP_ORDER = ['Common', 'Text', 'Code', 'Data', 'Docs', 'Image',
-                   'Audio', 'Video', 'Archive', 'Font', 'Other'];
-var COMMON = ('md json yaml toml txt csv xml html css js ts py sh pdf png jpg ' +
-              'svg zip log').split(' ');
-
-// argv: [newline-joined extensions, "1" to include types macOS does not know]
-function verbCatalog(argv) {
-  var exts = argv[0].split('\n');
-  var includeAll = (argv[1] === '1');
-  var rows = [];
-
-  exts.forEach(function (e) {
-    if (!e) return;
-    var uti = cf($.UTTypeCreatePreferredIdentifierForTag($.kUTTagClassFilenameExtension, $(e), $()));
-    if (!uti) return;
-    var known = (uti.indexOf('dyn.') !== 0 && $.UTTypeIsDeclared($(uti)));
-    if (!known && !includeAll) return;
-
-    var group = 'Other';
-    if (COMMON.indexOf(e) >= 0) {
-      group = 'Common';
-    } else if (known) {
-      for (var i = 0; i < GROUPS.length; i++) {
-        if ($.UTTypeConformsTo($(uti), $(GROUPS[i][0]))) { group = GROUPS[i][1]; break; }
-      }
-    }
-
-    var cur = cf($.LSCopyDefaultRoleHandlerForContentType($(uti), ALL));
-    rows.push({
-      ext: e, group: group,
-      desc: (known ? (cf($.UTTypeCopyDescription($(uti))) || uti) : 'unknown to macOS'),
-      app: cur ? appInfo(cur).name : ''
-    });
-  });
-
-  rows.sort(function (a, b) {
-    var d = GROUP_ORDER.indexOf(a.group) - GROUP_ORDER.indexOf(b.group);
-    return d || a.ext.localeCompare(b.ext);
-  });
-
-  return rows.map(function (r) {
-    return [r.ext, r.group, r.desc, r.app].map(tabsafe).join('\t');
   }).join('\n');
 }
 
@@ -462,7 +438,6 @@ function verbNames(bids) {
 function run(argv) {
   var verb = argv.shift();
   switch (verb) {
-    case 'catalog':    return verbCatalog(argv);
     case 'names':      return verbNames(argv);
     case 'resolve':    return verbResolve(argv);
     case 'candidates': return verbCandidates(argv);
@@ -832,7 +807,7 @@ undo_group() {
 
     local results
     results="$(jxa set "$target" "${back[@]}")"
-    while IFS=$'\t' read -r uti status _ now; do
+    while IFS=$'\t' read -r uti status now; do
       [[ -n "$uti" ]] || continue
       local was
       was="$(printf '%s\n' "$restorable" | awk -F'\t' -v u="$uti" '$5 == u { print $7; exit }')"
@@ -915,7 +890,7 @@ apply() {
   results="$(jxa set "$bid" "${utis[@]}")"
 
   printf '\n'
-  while IFS=$'\t' read -r uti status _ now; do
+  while IFS=$'\t' read -r uti status now; do
     [[ -n "$uti" ]] || continue
     if [[ "$status" == "ok" ]]; then
       local prev
@@ -998,6 +973,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$(uname -s)" == "Darwin" ]] || die "this only makes sense on macOS"
+[[ "$(sw_vers -productVersion | cut -d. -f1)" -ge 12 ]] || die "needs macOS 12 (Monterey) or later"
 
 case "$SUBCOMMAND" in
   history|log) show_history; exit 0 ;;

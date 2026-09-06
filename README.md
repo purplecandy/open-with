@@ -16,13 +16,13 @@ No Homebrew, no `duti`, no compiler, no `sudo`. One file of bash.
 
 ## No dependencies
 
-It drives the LaunchServices C API — `LSSetDefaultRoleHandlerForContentType`
-and friends — through the JavaScript-for-Automation ObjC bridge that ships with
-every Mac, and shells out to Apple's own `lsregister` for cleanup.
+It drives LaunchServices through Apple's current APIs — `NSWorkspace` and
+`UTType` — via the JavaScript-for-Automation ObjC bridge that ships with every
+Mac, and shells out to Apple's own `lsregister` for cleanup.
 
 Everything it calls is part of macOS: `/bin/bash` (works on the stock 3.2),
 `osascript`, and base BSD userland. Verified under `env -i` with Homebrew off
-`PATH`.
+`PATH`. Needs macOS 12 (Monterey) or later.
 
 `fzf` is used for the pickers if you have it; otherwise you get a numbered
 menu.
@@ -141,10 +141,14 @@ archive type).
 - `.ts` resolves to MPEG-2 Transport Stream, not TypeScript — macOS's opinion,
   not this script's. The picker shows you the resolved type before it commits,
   so you can see it coming.
-- Extension→UTI resolution uses `UTTypeCreatePreferredIdentifierForTag`, which
-  Apple has deprecated. Its replacement, the `UniformTypeIdentifiers`
-  framework, is not importable from JavaScript-for-Automation, so the
-  deprecated call is the one that works. Tested on Sequoia (macOS 15).
+- The `UniformTypeIdentifiers` framework has no bridge metadata, so
+  JavaScript-for-Automation cannot `import` it. The script reaches the `UTType`
+  class through the ObjC runtime instead, which works because AppKit already
+  loads the framework.
+- Setting a handler goes through NSWorkspace's asynchronous API, whose
+  completion callback JXA cannot receive. The script pumps the run loop and
+  waits up to three seconds for the change to become visible, then reports
+  success or failure from what it reads back. Tested on Sequoia (macOS 15).
 
 ## License
 

@@ -78,26 +78,6 @@ EXAMPLES
   open-with undo                    pick a change from the log to revert
   open-with undo 3                  revert entry 3 from the history
 
-UNDO
-  Every change is journalled to ~/.local/state/open-with/history.tsv (override
-  with $OPEN_WITH_STATE) along with the handler each type had beforehand, and
-  undo restores it. The undo is itself journalled, so undoing an undo is just
-  another "undo last".
-
-  One honest limitation: macOS can set a default handler but not remove one.
-  If a type had no default before, undo says so and leaves it alone rather
-  than guessing.
-
-WHY THIS EXISTS
-  macOS keeps registering apps it finds inside mounted .dmg volumes, temp
-  folders and old version directories. When one of those becomes the default
-  handler and the volume goes away, you get "the application can't be opened"
-  or "it has been moved to the Trash" - for an app sitting right there in
-  /Applications. open-with clears those ghosts before it sets anything, and
-  --doctor sweeps up the rest.
-
-  If it still won't stick, quit and reopen Finder (or log out and back in);
-  the Finder caches handlers per session.
 HELPDOC
 }
 

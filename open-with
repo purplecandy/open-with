@@ -21,9 +21,9 @@ HISTORY_MAX=2000
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
   BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
-  YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; RESET=$'\033[0m'
+  YELLOW=$'\033[33m'; CYAN=$'\033[36m'; RESET=$'\033[0m'
 else
-  BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; RESET=''
+  BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; CYAN=''; RESET=''
 fi
 
 die()  { printf '%sopen-with:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
@@ -606,7 +606,11 @@ undo_group() {
 
   printf '\n%sUndo %s from %s:%s\n' "$BOLD" "${app:-change}" "$when" "$RESET"
   local names uti prev new
-  names="$(jxa names $(printf '%s\n' "$restorable" | cut -f6 | sort -u | tr '\n' ' ') || true)"
+  local -a prev_bids=()
+  while IFS= read -r _b; do
+    [[ -n "$_b" ]] && prev_bids+=("$_b")
+  done < <(printf '%s\n' "$restorable" | cut -f6 | sort -u)
+  names="$(jxa names "${prev_bids[@]+"${prev_bids[@]}"}" || true)"
   while IFS=$'\t' read -r _ _ _ _ uti prev new _ _; do
     [[ -n "$uti" ]] || continue
     local prev_name
@@ -617,7 +621,7 @@ undo_group() {
   if [[ -n "$orphans" ]]; then
     printf '\n'
     warn "these had no previous default and will be left as they are:"
-    printf '  %s%s%s\n' "$DIM" "$(printf '%s ' $orphans)" "$RESET" >&2
+    printf '  %s%s%s\n' "$DIM" "$(printf '%s\n' "$orphans" | tr '\n' ' ')" "$RESET" >&2
   fi
 
   if [[ $DRY_RUN -eq 1 ]]; then
@@ -709,7 +713,7 @@ apply() {
   local undeclared
   undeclared="$(jxa declares "$bid" "${utis[@]}" | awk -F'\t' '$2 == "0" { print $1 }' || true)"
   if [[ -n "$undeclared" ]]; then
-    warn "$name does not advertise support for: $(printf '%s ' $undeclared)"
+    warn "$name does not advertise support for: $(printf '%s\n' "$undeclared" | tr '\n' ' ')"
     warn "Setting it anyway - this is what Finder's \"Change All\" does too."
   fi
 
@@ -853,7 +857,7 @@ TOKEN_MAP="$(printf '%s\n' "$RESOLVED" | awk -F'\t' '$2 != "" { print $2 "\t" $1
 
 UTIS=()
 SEEN=""
-while IFS=$'\t' read -r token uti how declared desc cur curname; do
+while IFS=$'\t' read -r token uti _ declared desc _ curname; do
   [[ -n "$token" ]] || continue
   if [[ -z "$uti" ]]; then
     warn "could not work out a type for '$token' - skipping"
@@ -885,7 +889,7 @@ IFS=$'\t' read -r APP_BID APP_NAME APP_PATH <<< "$APP_INFO"
 
 if [[ $ASSUME_YES -eq 0 && $DRY_RUN -eq 0 && -t 0 ]]; then
   printf '\n%sSet %s%s%s as the default for:%s\n' "$BOLD" "$CYAN" "$APP_NAME" "$RESET$BOLD" "$RESET"
-  while IFS=$'\t' read -r token uti how declared desc cur curname; do
+  while IFS=$'\t' read -r token uti _ declared desc _ curname; do
     [[ -n "$uti" ]] || continue
     printf '  %-10s %s%-28s%s %s%s → %s%s\n' \
       "$token" "$DIM" "${desc:-$uti}" "$RESET" "$DIM" "${curname:-none}" "$APP_NAME" "$RESET"

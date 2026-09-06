@@ -1,0 +1,910 @@
+#!/usr/bin/env bash
+#
+# open-with - set the default macOS application for file types, without the shenanigans.
+#
+# Pure macOS. No Homebrew, no duti, no compilers. Talks to LaunchServices directly
+# through the JavaScript-for-Automation ObjC bridge that ships with every Mac.
+#
+# https://github.com/purplecandy/open-with
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+# Append-only journal of everything this tool has changed, so it can be undone.
+STATE_DIR="${OPEN_WITH_STATE:-$HOME/.local/state/open-with}"
+HISTORY_FILE="$STATE_DIR/history.tsv"
+HISTORY_MAX=2000
+
+# ---------------------------------------------------------------- presentation
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  BOLD=$'\033[1m'; DIM=$'\033[2m'; RED=$'\033[31m'; GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'; BLUE=$'\033[34m'; CYAN=$'\033[36m'; RESET=$'\033[0m'
+else
+  BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; RESET=''
+fi
+
+die()  { printf '%sopen-with:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+info() { printf '%s›%s %s\n' "$DIM" "$RESET" "$*" >&2; }
+
+usage() {
+  cat <<'HELPDOC'
+open-with - set the default macOS app for file types
+
+USAGE
+  open-with [TYPE...] [-w APP] [options]
+  open-with history
+  open-with undo [last | N]
+
+TYPE may be given in any of these forms (mix freely):
+  md  .md  '*.md'         filename extension
+  text/markdown           MIME type
+  net.daringfireball.md   Uniform Type Identifier (UTI)
+  ~/notes/todo.md         an actual file (its extension is used)
+
+APP may be a name, a path, or a bundle identifier:
+  -w Zed                  -w "Visual Studio Code"
+  -w /Applications/Zed.app
+  -w dev.zed.Zed
+
+Omit TYPE and you get an interactive type picker.
+Omit -w and you get a picker of apps that can open the chosen types.
+
+OPTIONS
+  -w, --with APP     application to open these types with
+  -l, --list         show the current handler for TYPE (or for common types)
+      --history      list every change this tool has made
+      --undo [N]     revert a change (same as the undo subcommand)
+  -a, --all-apps     picker lists every installed app, not just capable ones
+  -d, --doctor       find and remove stale LaunchServices registrations
+  -n, --dry-run      show what would change, change nothing
+  -y, --yes          don't ask for confirmation
+  -q, --quiet        only print errors
+  -h, --help         show this help
+  -V, --version      show version
+
+EXAMPLES
+  open-with md json -w Zed          set Zed as default for Markdown and JSON
+  open-with                         pick types, then pick an app
+  open-with -w Zed                  pick types, set them all to Zed
+  open-with -l md json              what opens these right now?
+  open-with --doctor                clean up ghost app registrations
+  open-with history                 everything this tool has changed
+  open-with undo last               put the most recent change back
+  open-with undo                    pick a change from the log to revert
+  open-with undo 3                  revert entry 3 from the history
+
+UNDO
+  Every change is journalled to ~/.local/state/open-with/history.tsv (override
+  with $OPEN_WITH_STATE) along with the handler each type had beforehand, and
+  undo restores it. The undo is itself journalled, so undoing an undo is just
+  another "undo last".
+
+  One honest limitation: macOS can set a default handler but not remove one.
+  If a type had no default before, undo says so and leaves it alone rather
+  than guessing.
+
+WHY THIS EXISTS
+  macOS keeps registering apps it finds inside mounted .dmg volumes, temp
+  folders and old version directories. When one of those becomes the default
+  handler and the volume goes away, you get "the application can't be opened"
+  or "it has been moved to the Trash" - for an app sitting right there in
+  /Applications. open-with clears those ghosts before it sets anything, and
+  --doctor sweeps up the rest.
+
+  If it still won't stick, quit and reopen Finder (or log out and back in);
+  the Finder caches handlers per session.
+HELPDOC
+}
+
+# --------------------------------------------------------- LaunchServices glue
+#
+# One osascript process per call, so every verb takes a batch of arguments.
+# Fields are tab separated.
+
+jxa() {
+  osascript -l JavaScript - "$@" <<'JXA_EOF'
+ObjC.import('CoreServices');
+ObjC.import('AppKit');
+
+var ALL = 0xFFFFFFFF;
+var ws  = $.NSWorkspace.sharedWorkspace;
+
+// CoreServices returns CFStringRef, which JXA hands back as an untyped Ref.
+function cf(ref) {
+  try {
+    var o = ObjC.castRefToObject(ref);
+    return (o && o.js !== undefined) ? o.js : null;
+  } catch (e) { return null; }
+}
+
+function tabsafe(v) { return String(v === null ? '' : v).replace(/[\t\n]/g, ' '); }
+
+function appInfo(bid) {
+  var url = ws.URLForApplicationWithBundleIdentifier($(bid));
+  if (url.js === undefined) return { bid: bid, name: bid, path: '' };
+  var path = url.path.js;
+  return { bid: bid, name: path.split('/').pop().replace(/\.app$/, ''), path: path };
+}
+
+// A token is a MIME type, a UTI, or a bare filename extension.
+function resolveType(tok) {
+  if (tok.indexOf('/') >= 0) {
+    return { uti: cf($.UTTypeCreatePreferredIdentifierForTag($.kUTTagClassMIMEType, $(tok), $())), how: 'mime' };
+  }
+  // Looks like a UTI only if the system actually knows it; that keeps
+  // things like "tar.gz" from being mistaken for one.
+  if (tok.indexOf('.') >= 0 && (tok.indexOf('dyn.') === 0 || $.UTTypeIsDeclared($(tok)))) {
+    return { uti: tok, how: 'uti' };
+  }
+  return { uti: cf($.UTTypeCreatePreferredIdentifierForTag($.kUTTagClassFilenameExtension, $(tok), $())), how: 'ext' };
+}
+
+function verbResolve(args) {
+  return args.map(function (tok) {
+    var r = resolveType(tok);
+    if (!r.uti) return [tok, '', r.how, '0', '', '', ''].map(tabsafe).join('\t');
+    var declared = $.UTTypeIsDeclared($(r.uti)) && r.uti.indexOf('dyn.') !== 0;
+    var desc = cf($.UTTypeCopyDescription($(r.uti))) || '';
+    var cur = cf($.LSCopyDefaultRoleHandlerForContentType($(r.uti), ALL));
+    var curName = cur ? appInfo(cur).name : '';
+    return [tok, r.uti, r.how, declared ? '1' : '0', desc, cur || '', curName].map(tabsafe).join('\t');
+  }).join('\n');
+}
+
+// Apps that declare they can open these types, ranked by how many they cover.
+function verbCandidates(utis) {
+  var score = {}, order = [];
+  utis.forEach(function (uti) {
+    var list = ObjC.castRefToObject($.LSCopyAllRoleHandlersForContentType($(uti), ALL));
+    if (!list || list.count === undefined) return;
+    for (var i = 0; i < list.count; i++) {
+      var bid = list.objectAtIndex(i).js;
+      if (score[bid] === undefined) { score[bid] = 0; order.push(bid); }
+      score[bid]++;
+    }
+  });
+  return order
+    .map(function (bid) { var a = appInfo(bid); a.n = score[bid]; return a; })
+    .filter(function (a) { return a.path !== ''; })
+    .sort(function (x, y) { return y.n - x.n || x.name.localeCompare(y.name); })
+    .map(function (a) { return [a.n, a.bid, a.name, a.path].map(tabsafe).join('\t'); })
+    .join('\n');
+}
+
+function verbApps() {
+  var fm = $.NSFileManager.defaultManager;
+  var dirs = ['/Applications', '/Applications/Utilities', '/System/Applications',
+              '/System/Applications/Utilities',
+              $.NSHomeDirectory().js + '/Applications'];
+  var seen = {}, out = [];
+  dirs.forEach(function (dir) {
+    var items = fm.contentsOfDirectoryAtPathError($(dir), $());
+    if (items.js === undefined) return;
+    for (var i = 0; i < items.count; i++) {
+      var name = items.objectAtIndex(i).js;
+      if (!/\.app$/.test(name)) continue;
+      var path = dir + '/' + name;
+      var b = $.NSBundle.bundleWithPath($(path));
+      if (b.js === undefined || b.bundleIdentifier.js === undefined) continue;
+      var bid = b.bundleIdentifier.js;
+      if (seen[bid]) continue;
+      seen[bid] = true;
+      out.push(['1', bid, name.replace(/\.app$/, ''), path].map(tabsafe).join('\t'));
+    }
+  });
+  return out.sort().join('\n');
+}
+
+// name | path | bundle id -> bundle id, name, path
+function verbApp(query) {
+  var tries = [];
+  if (/\.app\/?$/.test(query)) {
+    var b = $.NSBundle.bundleWithPath($(query.replace(/\/$/, '')));
+    if (b.js !== undefined && b.bundleIdentifier.js !== undefined) tries.push(b.bundleIdentifier.js);
+  }
+  var byName = ws.fullPathForApplication($(query.replace(/\.app$/, '')));
+  if (byName.js !== undefined) {
+    var nb = $.NSBundle.bundleWithPath(byName);
+    if (nb.js !== undefined && nb.bundleIdentifier.js !== undefined) tries.push(nb.bundleIdentifier.js);
+  }
+  if (ws.URLForApplicationWithBundleIdentifier($(query)).js !== undefined) tries.push(query);
+
+  for (var i = 0; i < tries.length; i++) {
+    var a = appInfo(tries[i]);
+    if (a.path !== '') return [a.bid, a.name, a.path].map(tabsafe).join('\t');
+  }
+  return '';
+}
+
+function verbSet(args) {
+  var bid = args.shift();
+  return args.map(function (uti) {
+    var st = $.LSSetDefaultRoleHandlerForContentType($(uti), ALL, $(bid));
+    var now = cf($.LSCopyDefaultRoleHandlerForContentType($(uti), ALL));
+    var ok = (st === 0 && now === bid);
+    return [uti, ok ? 'ok' : 'fail', st, now || ''].map(tabsafe).join('\t');
+  }).join('\n');
+}
+
+// Does this app actually declare support for the type? Purely advisory.
+function verbDeclares(args) {
+  var bid = args.shift();
+  return args.map(function (uti) {
+    var list = ObjC.castRefToObject($.LSCopyAllRoleHandlersForContentType($(uti), ALL));
+    var yes = false;
+    if (list && list.count !== undefined) {
+      for (var i = 0; i < list.count && !yes; i++) yes = (list.objectAtIndex(i).js === bid);
+    }
+    return [uti, yes ? '1' : '0'].join('\t');
+  }).join('\n');
+}
+
+function verbNames(bids) {
+  return bids.map(function (bid) {
+    return [bid, appInfo(bid).name].map(tabsafe).join('\t');
+  }).join('\n');
+}
+
+function run(argv) {
+  var verb = argv.shift();
+  switch (verb) {
+    case 'names':      return verbNames(argv);
+    case 'resolve':    return verbResolve(argv);
+    case 'candidates': return verbCandidates(argv);
+    case 'apps':       return verbApps();
+    case 'app':        return verbApp(argv[0]);
+    case 'set':        return verbSet(argv);
+    case 'declares':   return verbDeclares(argv);
+  }
+  return '';
+}
+JXA_EOF
+}
+
+# ------------------------------------------------------------ ghost registrations
+#
+# lsregister -dump emits dash-delimited records. We want records whose app path
+# no longer exists and which are not helper bundles nested inside another app.
+
+ghost_paths() {
+  "$LSREGISTER" -dump 2>/dev/null | awk '
+    /^-{10,}$/ { if (p != "") print p; p = ""; next }
+    /^[ \t]*path:[ \t]+\// {
+      if (p == "") {
+        line = $0
+        sub(/^[ \t]*path:[ \t]+/, "", line)
+        sub(/ \(0x[0-9a-f]+\)$/, "", line)
+        if (line ~ /\.app$/) p = line
+      }
+    }
+    END { if (p != "") print p }
+  ' | sort -u | while IFS= read -r p; do
+    case "$p" in */Contents/*) continue ;; esac
+    [[ -e "$p" ]] || printf '%s\n' "$p"
+  done
+}
+
+unregister_paths() {
+  local p count=0
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    [[ $DRY_RUN -eq 1 ]] || "$LSREGISTER" -u "$p" >/dev/null 2>&1 || true
+    count=$((count + 1))
+  done
+  printf '%s\n' "$count"
+}
+
+# Clear ghosts that share a name with the app we are about to install as handler.
+# This is the specific failure that produces "the application has been moved to
+# the Trash" for an app that is plainly still installed.
+clear_shadowing_ghosts() {
+  local app_path="$1" base ghosts n
+  base="$(basename "$app_path")"
+  ghosts="$(ghost_paths | grep -F "/$base" || true)"
+  [[ -n "$ghosts" ]] || return 0
+
+  n="$(printf '%s\n' "$ghosts" | grep -c . || true)"
+  local verb="cleared"
+  [[ $DRY_RUN -eq 1 ]] && verb="would clear"
+  printf '%s\n' "${YELLOW}Found $n stale registration(s) shadowing $base:${RESET}" >&2
+  printf '%s\n' "$ghosts" | unregister_paths >/dev/null
+  printf '%s\n' "$ghosts" | sed "s|^|  ${DIM}${verb}${RESET} |" >&2
+
+  [[ $DRY_RUN -eq 1 ]] || "$LSREGISTER" -f -R "$app_path" >/dev/null 2>&1 || true
+}
+
+doctor() {
+  local ghosts n
+  info "Scanning the LaunchServices database..."
+  ghosts="$(ghost_paths || true)"
+
+  if [[ -z "$ghosts" ]]; then
+    printf '%s✓%s No stale app registrations. Nothing to do.\n' "$GREEN" "$RESET"
+    return 0
+  fi
+
+  n="$(printf '%s\n' "$ghosts" | grep -c . || true)"
+  printf '\n%sFound %s registration(s) pointing at apps that no longer exist:%s\n\n' "$BOLD" "$n" "$RESET"
+  printf '%s\n' "$ghosts" | awk -v d="$DIM" -v r="$RESET" '
+    { if ($0 ~ /^\/Volumes\//)      b = "unmounted disk image"
+      else if ($0 ~ /\.Trash/)      b = "in the Trash"
+      else if ($0 ~ /Temp|\/T\//)   b = "temp folder"
+      else                          b = "missing"
+      printf "  %-22s %s%s%s\n", "[" b "]", d, $0, r }'
+
+  printf '\nThese are what make macOS insist an installed app "cannot be found".\n'
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '\n%sDry run - nothing was unregistered.%s\n' "$YELLOW" "$RESET"
+    return 0
+  fi
+
+  if [[ $ASSUME_YES -eq 0 ]]; then
+    printf '\n%sUnregister all %s?%s [y/N] ' "$BOLD" "$n" "$RESET"
+    local reply; read -r reply </dev/tty || reply=""
+    [[ "$reply" =~ ^[Yy] ]] || { info "Left untouched."; return 0; }
+  fi
+
+  printf '\n'
+  printf '%s\n' "$ghosts" | unregister_paths >/dev/null
+
+  # Recorded for the audit trail only; a registration for a deleted app
+  # cannot be put back, and would be useless if it could.
+  local dgroup path
+  dgroup="$(history_new_group)"
+  while IFS= read -r path; do
+    [[ -n "$path" ]] && history_record "$dgroup" unregister "$path" "" "" "doctor"
+  done <<< "$ghosts"
+
+  printf '\n%s✓%s Cleaned %s stale registration(s). Installed apps were not touched.\n' "$GREEN" "$RESET" "$n"
+}
+
+# ---------------------------------------------------------------------- pickers
+
+have_fzf() { command -v fzf >/dev/null 2>&1; }
+
+# Reads "key<TAB>display" lines on stdin, writes chosen keys on stdout.
+pick() {
+  local prompt="$1" multi="$2" lines
+  lines="$(cat)"
+  [[ -n "$lines" ]] || return 1
+
+  if have_fzf; then
+    local header="$3"
+    local -a args=(--ansi --prompt="$prompt > " --height=80% --reverse
+                   --delimiter=$'\t' --with-nth=2..)
+    if [[ "$multi" == "multi" ]]; then
+      args+=(--multi --marker='+' --header="$header  (TAB to mark, ENTER to confirm)")
+    else
+      args+=(--header="$header  (ENTER to choose)")
+    fi
+    printf '%s\n' "$lines" | fzf "${args[@]}" | cut -f1
+    return 0
+  fi
+
+  # Numbered fallback, no dependencies.
+  printf '\n%s%s%s\n' "$BOLD" "$3" "$RESET" >&2
+  printf '%s\n' "$lines" | awk -F'\t' -v c="$CYAN" -v r="$RESET" \
+    '{ printf "  %s%3d%s  %s\n", c, NR, r, $2 }' >&2
+  if [[ "$multi" == "multi" ]]; then
+    printf '\n%s → numbers, ranges (1-4), or "all":%s ' "$BOLD$prompt" "$RESET" >&2
+  else
+    printf '\n%s → number:%s ' "$BOLD$prompt" "$RESET" >&2
+  fi
+
+  local reply; read -r reply </dev/tty || reply=""
+  [[ -n "$reply" ]] || return 1
+
+  printf '%s\n' "$lines" | awk -F'\t' -v sel="$reply" -v multi="$multi" '
+    BEGIN {
+      if (sel == "all" || sel == "a") { all = 1 }
+      gsub(/,/, " ", sel)
+      n = split(sel, parts, / +/)
+      for (i = 1; i <= n; i++) {
+        if (parts[i] ~ /^[0-9]+-[0-9]+$/) {
+          split(parts[i], rr, "-")
+          for (j = rr[1]; j <= rr[2]; j++) want[j] = 1
+        } else if (parts[i] ~ /^[0-9]+$/) want[parts[i]] = 1
+      }
+    }
+    (all || want[NR]) { print $1; if (multi != "multi") exit }
+  '
+}
+
+pick_types() {
+  # group, extension - deliberately short and opinionated.
+  local catalog="Docs md
+Docs markdown
+Docs txt
+Docs rtf
+Docs pdf
+Docs epub
+Data json
+Data yaml
+Data yml
+Data toml
+Data xml
+Data csv
+Data tsv
+Data plist
+Data sql
+Config conf
+Config ini
+Config log
+Config env
+Web html
+Web css
+Web js
+Web mjs
+Web ts
+Web tsx
+Web jsx
+Web svg
+Code py
+Code rb
+Code go
+Code rs
+Code java
+Code kt
+Code swift
+Code c
+Code h
+Code cpp
+Code lua
+Code php
+Code sh
+Code zsh
+Code diff
+Code patch
+Media png
+Media jpg
+Media gif
+Media webp
+Media mp4
+Media mov
+Media mp3
+Media wav
+Archive zip
+Archive gz
+Archive tar
+Archive dmg"
+
+  local tokens resolved
+  tokens="$(printf '%s\n' "$catalog" | awk '{print $2}')"
+  # shellcheck disable=SC2046
+  resolved="$(jxa resolve $(printf '%s\n' "$tokens" | tr '\n' ' '))"
+
+  paste <(printf '%s\n' "$catalog" | awk '{print $1}') <(printf '%s\n' "$resolved") \
+    | awk -F'\t' -v d="$DIM" -v g="$GREEN" -v r="$RESET" '
+        $3 != "" {
+          cur = ($8 != "" ? $8 : "-")
+          printf "%s\t%-9s %-12s %s%-28s%s %s→ %s%s\n", $2, $1, $2, d, ($6 == "" ? $3 : $6), r, d, cur, r
+        }' \
+    | pick "types" multi "Select file types"
+}
+
+pick_app() {
+  local verb="candidates" listing
+  [[ $ALL_APPS -eq 1 ]] && verb="apps"
+
+  if [[ "$verb" == "candidates" ]]; then
+    listing="$(jxa candidates "$@" || true)"
+  else
+    listing="$(jxa apps || true)"
+  fi
+  [[ -n "$listing" ]] || return 1
+
+  printf '%s\n' "$listing" | awk -F'\t' -v total="$#" -v d="$DIM" -v r="$RESET" -v y="$YELLOW" '
+    {
+      flag = (total > 1 && $1 != "" && $1 + 0 < total) ? y "partial" r : "       "
+      printf "%s\t%-26s %s  %s%s%s\n", $2, $3, flag, d, $4, r
+    }' \
+    | pick "app" single "Open these with"
+}
+
+# ---------------------------------------------------------------------- history
+#
+# One tab-separated line per changed type:
+#   epoch  iso  group  action  uti  previous_bundle_id  new_bundle_id  app  note
+# `group` ties one invocation together, so undo reverts a whole command.
+
+history_new_group() { printf '%s-%s\n' "$(date +%s)" "$$"; }
+
+history_record() {
+  local group="$1" action="$2" uti="$3" prev="$4" new="$5" app="$6" note="${7:-}" token="${8:-}"
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "$(date '+%Y-%m-%d %H:%M')" "$group" "$action" \
+    "$uti" "$prev" "$new" "$app" "$note" "$token" >> "$HISTORY_FILE"
+
+  # Keep the journal from growing without bound.
+  local n
+  n="$(wc -l < "$HISTORY_FILE" 2>/dev/null || echo 0)"
+  if [[ "$n" -gt $((HISTORY_MAX * 2)) ]]; then
+    tail -n "$HISTORY_MAX" "$HISTORY_FILE" > "$HISTORY_FILE.tmp" 2>/dev/null \
+      && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+  fi
+}
+
+# Collapses the journal into one line per group, newest first:
+#   group  iso  app  count  summary  undoable
+history_groups() {
+  [[ -s "$HISTORY_FILE" ]] || return 1
+  awk -F'\t' '
+    {
+      g = $3
+      if (!(g in seen)) { seen[g] = 1; order[++k] = g; iso[g] = $2; note[g] = $9 }
+      if ($8 != "" && !((g SUBSEP $8) in appseen)) {
+        appseen[g SUBSEP $8] = 1
+        napps[g]++
+        app[g] = ($8)
+      }
+      act[g]   = $4
+      count[g]++
+      if ($4 == "set") {
+        if ($10 != "") { short = $10 }
+        else if ($5 ~ /^dyn\./) { short = "(dynamic type)" }
+        else { short = $5; sub(/^.*\./, "", short) }
+        summary[g] = (summary[g] == "" ? short : summary[g] ", " short)
+        if ($6 != "") undoable[g] = 1
+      } else {
+        summary[g] = count[g] " stale registration(s)"
+      }
+    }
+    END {
+      for (i = k; i >= 1; i--) {
+        g = order[i]
+        label = (napps[g] > 1) ? ("several (" napps[g] ")") : app[g]
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n", g, iso[g], label, count[g],
+               summary[g], (undoable[g] ? "1" : "0")
+      }
+    }
+  ' "$HISTORY_FILE"
+}
+
+show_history() {
+  local groups
+  groups="$(history_groups || true)"
+  if [[ -z "$groups" ]]; then
+    printf '\n%sNo changes recorded yet.%s\n\n' "$DIM" "$RESET"
+    return 0
+  fi
+  printf '\n%s%-4s %-17s %-20s %s%s\n' "$BOLD" "#" "WHEN" "APP" "TYPES" "$RESET"
+  printf '%s\n' "$groups" | awk -F'\t' -v d="$DIM" -v r="$RESET" -v y="$YELLOW" '
+    {
+      mark = ($6 == "1") ? "" : y " (not undoable)" r
+      printf "%-4d %-17s %-20s %s%s\n", NR, $2, ($3 == "" ? "-" : $3), $5, mark
+    }'
+  printf '\n%sUndo the most recent with:%s open-with undo last\n\n' "$DIM" "$RESET"
+}
+
+# Revert one group: put every type back to the handler it had before.
+undo_group() {
+  local group="$1" entries restorable app when
+  entries="$(awk -F'\t' -v g="$group" '$3 == g && $4 == "set"' "$HISTORY_FILE" || true)"
+
+  if [[ -z "$entries" ]]; then
+    die "nothing undoable in that entry (ghost cleanups cannot be reversed - the apps are gone)"
+  fi
+
+  app="$(printf '%s\n' "$entries" | head -1 | cut -f8)"
+  when="$(printf '%s\n' "$entries" | head -1 | cut -f2)"
+
+  # Only types that had a previous handler can be restored.
+  restorable="$(printf '%s\n' "$entries" | awk -F'\t' '$6 != ""' || true)"
+  local orphans
+  orphans="$(printf '%s\n' "$entries" | awk -F'\t' '$6 == "" { print $5 }' || true)"
+
+  if [[ -z "$restorable" ]]; then
+    warn "Those types had no previous default, and macOS offers no way to unset one."
+    die "nothing to restore"
+  fi
+
+  printf '\n%sUndo %s from %s:%s\n' "$BOLD" "${app:-change}" "$when" "$RESET"
+  local names uti prev new
+  names="$(jxa names $(printf '%s\n' "$restorable" | cut -f6 | sort -u | tr '\n' ' ') || true)"
+  while IFS=$'\t' read -r _ _ _ _ uti prev new _ _; do
+    [[ -n "$uti" ]] || continue
+    local prev_name
+    prev_name="$(printf '%s\n' "$names" | awk -F'\t' -v b="$prev" '$1 == b { print $2; exit }')"
+    printf '  %-34s %s%s → %s%s\n' "$uti" "$DIM" "${app:-$new}" "${prev_name:-$prev}" "$RESET"
+  done <<< "$restorable"
+
+  if [[ -n "$orphans" ]]; then
+    printf '\n'
+    warn "these had no previous default and will be left as they are:"
+    printf '  %s%s%s\n' "$DIM" "$(printf '%s ' $orphans)" "$RESET" >&2
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '\n%sDry run - nothing was changed.%s\n' "$YELLOW" "$RESET"
+    return 0
+  fi
+
+  if [[ $ASSUME_YES -eq 0 && -t 0 ]]; then
+    printf '\n%sProceed?%s [Y/n] ' "$BOLD" "$RESET"
+    local reply; read -r reply </dev/tty || reply=""
+    [[ -z "$reply" || "$reply" =~ ^[Yy] ]] || { info "Cancelled."; return 0; }
+  fi
+
+  # Group by target app so each restore is a single LaunchServices batch.
+  local new_group failed=0
+  new_group="$(history_new_group)"
+  printf '\n'
+  local target
+  for target in $(printf '%s\n' "$restorable" | cut -f6 | sort -u); do
+    local -a back=()
+    while IFS=$'\t' read -r _ _ _ _ uti prev new _ _; do
+      [[ "$prev" == "$target" ]] && back+=("$uti")
+    done <<< "$restorable"
+    [[ ${#back[@]} -gt 0 ]] || continue
+
+    local results
+    results="$(jxa set "$target" "${back[@]}")"
+    while IFS=$'\t' read -r uti status _ now; do
+      [[ -n "$uti" ]] || continue
+      local was
+      was="$(printf '%s\n' "$restorable" | awk -F'\t' -v u="$uti" '$5 == u { print $7; exit }')"
+      if [[ "$status" == "ok" ]]; then
+        printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$uti"
+        history_record "$new_group" set "$uti" "$was" "$target" \
+          "$(printf '%s\n' "$names" | awk -F'\t' -v b="$target" '$1 == b { print $2; exit }')" \
+          "undo-of:$group" \
+          "$(printf '%s\n' "$restorable" | awk -F'\t' -v u="$uti" '$5 == u { print $10; exit }')"
+      else
+        failed=1
+        printf '  %s✗%s %s %s(still %s)%s\n' "$RED" "$RESET" "$uti" "$DIM" "${now:-unset}" "$RESET"
+      fi
+    done <<< "$results"
+  done
+
+  [[ $failed -eq 0 ]] || { printf '\n%sSome types could not be restored.%s\n' "$YELLOW" "$RESET"; return 1; }
+  printf '\n%s✓%s Undone. (This undo is itself in the log - "open-with undo last" again to redo.)\n' "$GREEN" "$RESET"
+}
+
+do_undo() {
+  local which="${1:-}"
+  local groups
+  groups="$(history_groups || true)"
+  [[ -n "$groups" ]] || die "nothing to undo - no changes recorded yet"
+
+  local target=""
+  if [[ -z "$which" ]]; then
+    [[ -t 0 ]] || die "no entry given and no terminal to ask on"
+    target="$(printf '%s\n' "$groups" | awk -F'\t' -v d="$DIM" -v r="$RESET" -v y="$YELLOW" '
+      { mark = ($6 == "1") ? "" : y " (not undoable)" r
+        printf "%s\t%-17s %-20s %s%s\n", $1, $2, ($3 == "" ? "-" : $3), $5, mark }' \
+      | pick "undo" single "Which change should be reverted?" || true)"
+    [[ -n "$target" ]] || die "nothing selected"
+  elif [[ "$which" == "last" ]]; then
+    # The most recent entry that can actually be reverted.
+    target="$(printf '%s\n' "$groups" | awk -F'\t' '$6 == "1" { print $1; exit }')"
+    [[ -n "$target" ]] || die "no undoable change in the log (ghost cleanups cannot be reversed)"
+  elif [[ "$which" =~ ^[0-9]+$ ]]; then
+    target="$(printf '%s\n' "$groups" | awk -F'\t' -v n="$which" 'NR == n { print $1; exit }')"
+    [[ -n "$target" ]] || die "no entry #$which - try: open-with history"
+  else
+    die "undo takes 'last', a number from 'open-with history', or nothing for a picker"
+  fi
+
+  undo_group "$target"
+}
+
+# ------------------------------------------------------------------------ apply
+
+# Set in main() from the resolve output: "uti<TAB>token" per line.
+TOKEN_MAP=""
+token_for() { printf '%s\n' "$TOKEN_MAP" | awk -F'\t' -v u="$1" '$1 == u { print $2; exit }'; }
+
+apply() {
+  local bid="$1" name="$2" app_path="$3"; shift 3
+  local -a utis=("$@")
+
+  clear_shadowing_ghosts "$app_path"
+
+  local undeclared
+  undeclared="$(jxa declares "$bid" "${utis[@]}" | awk -F'\t' '$2 == "0" { print $1 }' || true)"
+  if [[ -n "$undeclared" ]]; then
+    warn "$name does not advertise support for: $(printf '%s ' $undeclared)"
+    warn "Setting it anyway - this is what Finder's \"Change All\" does too."
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    printf '\n%sDry run - would set %s as the default for:%s\n' "$YELLOW" "$name" "$RESET"
+    printf '  %s\n' "${utis[@]}"
+    return 0
+  fi
+
+  # Snapshot the current handlers first - this is what undo restores.
+  local before
+  before="$(jxa resolve "${utis[@]}" || true)"
+
+  local results failed=0 group
+  group="$(history_new_group)"
+  results="$(jxa set "$bid" "${utis[@]}")"
+
+  printf '\n'
+  while IFS=$'\t' read -r uti status _ now; do
+    [[ -n "$uti" ]] || continue
+    if [[ "$status" == "ok" ]]; then
+      local prev
+      prev="$(printf '%s\n' "$before" | awk -F'\t' -v u="$uti" '$2 == u { print $6; exit }')"
+      history_record "$group" set "$uti" "$prev" "$bid" "$name" "" "$(token_for "$uti")"
+      printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$uti"
+    else
+      failed=1
+      printf '  %s✗%s %s %s(still %s)%s\n' "$RED" "$RESET" "$uti" "$DIM" "${now:-unset}" "$RESET"
+    fi
+  done <<< "$results"
+
+  if [[ $failed -eq 1 ]]; then
+    printf '\n%sSome types did not take.%s Try: open-with --doctor\n' "$YELLOW" "$RESET"
+    return 1
+  fi
+
+  printf '\n%s✓%s %s is now the default for %s type(s).\n' "$GREEN" "$RESET" "$BOLD$name$RESET" "${#utis[@]}"
+  printf '%s  Already-open Finder windows may need a restart to catch up.%s\n' "$DIM" "$RESET"
+  printf '%s  Changed your mind? open-with undo last%s\n' "$DIM" "$RESET"
+}
+
+list_types() {
+  local -a tokens=("$@")
+  if [[ ${#tokens[@]} -eq 0 ]]; then
+    tokens=(md json yaml toml xml csv html css js ts py sh txt pdf png svg zip)
+  fi
+  printf '\n%s%-14s %-30s %s%s\n' "$BOLD" "TYPE" "UTI" "OPENS WITH" "$RESET"
+  jxa resolve "${tokens[@]}" | awk -F'\t' -v d="$DIM" -v r="$RESET" -v y="$YELLOW" '
+    {
+      if ($2 == "") { printf "%-14s %s(unrecognised)%s\n", $1, y, r; next }
+      dyn = ($4 == "0") ? y "  dynamic" r : ""
+      printf "%-14s %s%-30s%s %s%s\n", $1, d, $2, r, ($7 != "" ? $7 : "(none)"), dyn
+    }'
+  printf '\n'
+}
+
+# ------------------------------------------------------------------------- main
+
+APP_QUERY=""
+DRY_RUN=0
+ASSUME_YES=0
+ALL_APPS=0
+QUIET=0
+DO_LIST=0
+DO_DOCTOR=0
+TOKENS=()
+
+# `undo` and `history` read as verbs, so accept them as a leading subcommand.
+# An extension genuinely called "undo" can still be written as ".undo".
+SUBCOMMAND=""
+UNDO_ARG=""
+if [[ $# -gt 0 ]]; then
+  case "$1" in
+    undo|history|log) SUBCOMMAND="$1"; shift
+                      if [[ $# -gt 0 && "$1" != -* ]]; then UNDO_ARG="$1"; shift; fi ;;
+  esac
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --undo)        SUBCOMMAND="undo"
+                   if [[ $# -ge 2 && "$2" != -* ]]; then UNDO_ARG="$2"; shift 2; else shift; fi ;;
+    --history)     SUBCOMMAND="history"; shift ;;
+    -w|--with)     [[ $# -ge 2 ]] || die "--with needs an application"; APP_QUERY="$2"; shift 2 ;;
+    --with=*)      APP_QUERY="${1#*=}"; shift ;;
+    -l|--list)     DO_LIST=1; shift ;;
+    -d|--doctor)   DO_DOCTOR=1; shift ;;
+    -a|--all-apps) ALL_APPS=1; shift ;;
+    -n|--dry-run)  DRY_RUN=1; shift ;;
+    -y|--yes)      ASSUME_YES=1; shift ;;
+    -q|--quiet)    QUIET=1; shift ;;
+    -h|--help)     usage; exit 0 ;;
+    -V|--version)  printf 'open-with %s\n' "$VERSION"; exit 0 ;;
+    --)            shift; while [[ $# -gt 0 ]]; do TOKENS+=("$1"); shift; done ;;
+    -*)            die "unknown option: $1  (try --help)" ;;
+    *)             TOKENS+=("$1"); shift ;;
+  esac
+done
+
+[[ "$(uname -s)" == "Darwin" ]] || die "this only makes sense on macOS"
+[[ $QUIET -eq 1 ]] && exec 2>/dev/null
+
+# A token may be an actual file; use its extension.
+# The name "open-with" invites "open THIS FILE with that app". It does not do
+# that (see `open -a`); it changes the default for the whole type. When someone
+# hands us a real file, say so plainly before changing anything.
+NORMALISED=()
+FILE_HINTS=""
+for tok in "${TOKENS[@]+"${TOKENS[@]}"}"; do
+  if [[ -e "$tok" && "$tok" == *.* ]]; then
+    NORMALISED+=("${tok##*.}")
+    FILE_HINTS="${FILE_HINTS}$(basename "$tok")	${tok##*.}
+"
+  else
+    tok="${tok#\*}"          # *.md -> .md
+    NORMALISED+=("${tok#.}") # .md  -> md
+  fi
+done
+
+case "$SUBCOMMAND" in
+  history|log) show_history; exit 0 ;;
+  undo)        do_undo "$UNDO_ARG"; exit $? ;;
+esac
+
+if [[ $DO_DOCTOR -eq 1 ]]; then doctor; exit $?; fi
+if [[ $DO_LIST -eq 1 ]]; then list_types "${NORMALISED[@]+"${NORMALISED[@]}"}"; exit 0; fi
+
+# ---- 1. which types?
+
+if [[ ${#NORMALISED[@]} -eq 0 ]]; then
+  [[ -t 0 ]] || die "no types given and no terminal to ask on"
+  NORMALISED=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && NORMALISED+=("$line")
+  done < <(pick_types || true)
+  [[ ${#NORMALISED[@]} -gt 0 ]] || die "nothing selected"
+fi
+
+RESOLVED="$(jxa resolve "${NORMALISED[@]}")"
+TOKEN_MAP="$(printf '%s\n' "$RESOLVED" | awk -F'\t' '$2 != "" { print $2 "\t" $1 }')"
+
+UTIS=()
+SEEN=""
+while IFS=$'\t' read -r token uti how declared desc cur curname; do
+  [[ -n "$token" ]] || continue
+  if [[ -z "$uti" ]]; then
+    warn "could not work out a type for '$token' - skipping"
+    continue
+  fi
+  case " $SEEN " in *" $uti "*) continue ;; esac
+  SEEN="$SEEN $uti"
+  UTIS+=("$uti")
+  if [[ "$declared" == "0" ]]; then
+    warn "'$token' has no registered type on this Mac; using a dynamic identifier"
+  fi
+done <<< "$RESOLVED"
+
+[[ ${#UTIS[@]} -gt 0 ]] || die "no usable types"
+
+# ---- 2. which app?
+
+if [[ -z "$APP_QUERY" ]]; then
+  [[ -t 0 ]] || die "no application given and no terminal to ask on"
+  APP_QUERY="$(pick_app "${UTIS[@]}" || true)"
+  [[ -n "$APP_QUERY" ]] || die "no application selected"
+fi
+
+APP_INFO="$(jxa app "$APP_QUERY" || true)"
+[[ -n "$APP_INFO" ]] || die "no application matching '$APP_QUERY' (name, path or bundle id)"
+IFS=$'\t' read -r APP_BID APP_NAME APP_PATH <<< "$APP_INFO"
+
+# ---- 3. confirm and apply
+
+if [[ $ASSUME_YES -eq 0 && $DRY_RUN -eq 0 && -t 0 ]]; then
+  printf '\n%sSet %s%s%s as the default for:%s\n' "$BOLD" "$CYAN" "$APP_NAME" "$RESET$BOLD" "$RESET"
+  while IFS=$'\t' read -r token uti how declared desc cur curname; do
+    [[ -n "$uti" ]] || continue
+    printf '  %-10s %s%-28s%s %s%s → %s%s\n' \
+      "$token" "$DIM" "${desc:-$uti}" "$RESET" "$DIM" "${curname:-none}" "$APP_NAME" "$RESET"
+  done <<< "$RESOLVED"
+
+  if [[ -n "$FILE_HINTS" ]]; then
+    printf '\n'
+    while IFS=$'\t' read -r fname fext; do
+      [[ -n "$fname" ]] || continue
+      printf '%s  Note: this applies to every .%s file, not just %s.%s\n' \
+        "$YELLOW" "$fext" "$fname" "$RESET"
+    done <<< "$FILE_HINTS"
+    printf '%s  To open one file once, use: open -a %s %s%s\n' \
+      "$DIM" "$APP_NAME" "$(printf '%s\n' "$FILE_HINTS" | head -1 | cut -f1)" "$RESET"
+  fi
+
+  printf '\n%sProceed?%s [Y/n] ' "$BOLD" "$RESET"
+  read -r REPLY </dev/tty || REPLY=""
+  [[ -z "$REPLY" || "$REPLY" =~ ^[Yy] ]] || { info "Cancelled."; exit 0; }
+fi
+
+apply "$APP_BID" "$APP_NAME" "$APP_PATH" "${UTIS[@]}"

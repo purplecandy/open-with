@@ -4,6 +4,7 @@ Set the default macOS application for file types, from the terminal.
 
 ```sh
 open-with md json -w Zed      # Markdown and JSON now open in Zed
+open-with @images -w Preview  # every common image type, in one go
 open-with                     # pick types, then pick an app
 open-with -l                  # what opens what right now?
 open-with history             # everything it has changed
@@ -11,7 +12,7 @@ open-with undo last           # put it back
 open-with --doctor            # clean up ghost app registrations
 ```
 
-No Homebrew, no `duti`, no compiler, no `sudo`. One file, ~700 lines of bash.
+No Homebrew, no `duti`, no compiler, no `sudo`. One file of bash.
 
 ## No dependencies
 
@@ -66,10 +67,14 @@ A type can be written however you happen to think of it:
 | MIME type | `text/markdown` |
 | UTI | `net.daringfireball.markdown` |
 | an actual file | `~/notes/todo.md` |
+| a group | `@images`, `@code`, `@media` |
 
 Extensions macOS has no registered type for (`.mdx`, `.astro`, `.envrc`) still
 work — they get a dynamic identifier, which is exactly what Finder's
 *Get Info → Change All…* does.
+
+The interactive picker lists about 130 common types. Anything not in that list
+can be typed into the picker, or passed on the command line as usual.
 
 Passing a real file uses its extension, and says so before it changes anything:
 
@@ -82,11 +87,39 @@ Set Zed as the default for:
   To open one file once, use: open -a Zed report.md
 ```
 
+## Groups
+
+A `@group` stands for a set of extensions, so one word covers a whole category:
+
+```sh
+open-with @images -w Preview
+open-with @code @web @data -w Zed
+open-with -l @audio
+```
+
+| Group | Covers |
+|---|---|
+| `@text` (`@txt`) | txt, md, markdown, mdx, rst, adoc, org, tex, log, ... |
+| `@docs` | pdf, epub, rtf, doc, docx, odt, ppt, pptx, xls, xlsx, ... |
+| `@data` | json, yaml, toml, xml, csv, tsv, plist, ini, conf, env, sql, ... |
+| `@code` | py, rb, go, rs, java, kt, swift, c, cpp, sh, zsh, lua, php, ... |
+| `@web` | html, css, scss, js, ts, jsx, tsx, vue, svelte, astro, svg, ... |
+| `@images` (`@img`) | png, jpg, jpeg, gif, webp, heic, avif, tiff, bmp, svg, psd, ... |
+| `@audio` | mp3, wav, flac, aac, m4a, ogg, opus, aiff, ... |
+| `@video` | mp4, mov, mkv, avi, webm, m4v, ... |
+| `@archives` (`@zip`) | zip, tar, gz, tgz, bz2, xz, 7z, rar, dmg, iso, pkg, ... |
+| `@media` | everything in `@images`, `@audio` and `@video` |
+
+`open-with --groups` prints the full membership. The `@` is what keeps
+`open-with zip` (the `.zip` extension) distinct from `open-with @zip` (every
+archive type).
+
 ## Options
 
 ```
 -w, --with APP     application: name, path, or bundle id
 -l, --list         show current handlers
+    --groups       list the @groups and what is in them
 -a, --all-apps     list every app, not just capable ones
 -d, --doctor       find and remove stale registrations
     --history      list every change this tool has made

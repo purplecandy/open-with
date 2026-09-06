@@ -4,6 +4,9 @@ Choose which app opens a kind of file on your Mac. One line in the Terminal.
 
 ![open-with demo](demo.gif)
 
+Why? 
+> The engineers at Apple made a trivial thing a multi step process. Worse, the gatekeeper keeps pestering you for permission every time you try to open a file from an application downloaded outside of App Store. I built this to make the trivial thing trivial again.
+
 ## Install
 
 Paste this into Terminal and press Enter:

@@ -93,7 +93,7 @@ Set Zed as the default for:
     --undo [N]     revert a change
 -n, --dry-run      show what would change, change nothing
 -y, --yes          skip confirmation
--q, --quiet        only print errors
+-q, --quiet        suppress notes and warnings
 -h, --help         full help
 ```
 

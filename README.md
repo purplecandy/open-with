@@ -165,6 +165,10 @@ trail but are not reversible either — the apps they pointed at no longer exist
 
 ## Caveats
 
+- `--doctor` treats any registered app whose path does not currently exist as
+  stale. An app on an external drive that is unplugged right now fits that
+  description too. Unregistering it is harmless - macOS re-registers it the
+  next time it launches - but you may want to plug the drive in first.
 - Finder caches handlers per session. If a change does not appear to take,
   relaunch Finder or log out and back in.
 - `.ts` resolves to MPEG-2 Transport Stream, not TypeScript — macOS's opinion,

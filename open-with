@@ -26,9 +26,10 @@ else
   BOLD=''; DIM=''; RED=''; GREEN=''; YELLOW=''; CYAN=''; RESET=''
 fi
 
+QUIET=0
 die()  { printf '%sopen-with:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
-warn() { printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
-info() { printf '%s›%s %s\n' "$DIM" "$RESET" "$*" >&2; }
+warn() { [[ $QUIET -eq 1 ]] || printf '%s!%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+info() { [[ $QUIET -eq 1 ]] || printf '%s›%s %s\n' "$DIM" "$RESET" "$*" >&2; }
 
 usage() {
   cat <<'HELPDOC'
@@ -62,7 +63,7 @@ OPTIONS
   -d, --doctor       find and remove stale LaunchServices registrations
   -n, --dry-run      show what would change, change nothing
   -y, --yes          don't ask for confirmation
-  -q, --quiet        only print errors
+  -q, --quiet        suppress notes and warnings (errors still print)
   -h, --help         show this help
   -V, --version      show version
 
@@ -304,6 +305,7 @@ unregister_paths() {
 clear_shadowing_ghosts() {
   local app_path="$1" base ghosts n
   base="$(basename "$app_path")"
+  info "Checking for stale registrations of $base (this takes a few seconds)..."
   ghosts="$(ghost_paths | grep -F "/$base" || true)"
   [[ -n "$ghosts" ]] || return 0
 
@@ -509,7 +511,8 @@ pick_app() {
 # ---------------------------------------------------------------------- history
 #
 # One tab-separated line per changed type:
-#   epoch  iso  group  action  uti  previous_bundle_id  new_bundle_id  app  note
+#   epoch  iso  group  action  uti  previous_bundle_id  new_bundle_id  app  note  token
+# `token` is the type as the user typed it (md, text/markdown, ...), for display.
 # `group` ties one invocation together, so undo reverts a whole command.
 
 history_new_group() { printf '%s-%s\n' "$(date +%s)" "$$"; }
@@ -700,7 +703,9 @@ do_undo() {
 
 # ------------------------------------------------------------------------ apply
 
-# Set in main() from the resolve output: "uti<TAB>token" per line.
+# Set in main(). RESOLVED is the raw `jxa resolve` output for the chosen types;
+# TOKEN_MAP is "uti<TAB>token" per line, derived from it.
+RESOLVED=""
 TOKEN_MAP=""
 token_for() { printf '%s\n' "$TOKEN_MAP" | awk -F'\t' -v u="$1" '$1 == u { print $2; exit }'; }
 
@@ -723,10 +728,8 @@ apply() {
     return 0
   fi
 
-  # Snapshot the current handlers first - this is what undo restores.
-  local before
-  before="$(jxa resolve "${utis[@]}" || true)"
-
+  # Previous handlers come from the resolve in main() - the same values the
+  # confirmation prompt showed. That is what undo restores.
   local results failed=0 group
   group="$(history_new_group)"
   results="$(jxa set "$bid" "${utis[@]}")"
@@ -736,7 +739,7 @@ apply() {
     [[ -n "$uti" ]] || continue
     if [[ "$status" == "ok" ]]; then
       local prev
-      prev="$(printf '%s\n' "$before" | awk -F'\t' -v u="$uti" '$2 == u { print $6; exit }')"
+      prev="$(printf '%s\n' "$RESOLVED" | awk -F'\t' -v u="$uti" '$2 == u { print $6; exit }')"
       history_record "$group" set "$uti" "$prev" "$bid" "$name" "" "$(token_for "$uti")"
       printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$uti"
     else
@@ -776,7 +779,6 @@ APP_QUERY=""
 DRY_RUN=0
 ASSUME_YES=0
 ALL_APPS=0
-QUIET=0
 DO_LIST=0
 DO_DOCTOR=0
 TOKENS=()
@@ -796,6 +798,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --undo)        SUBCOMMAND="undo"
                    if [[ $# -ge 2 && "$2" != -* ]]; then UNDO_ARG="$2"; shift 2; else shift; fi ;;
+    --undo=*)      SUBCOMMAND="undo"; UNDO_ARG="${1#*=}"; shift ;;
     --history)     SUBCOMMAND="history"; shift ;;
     -w|--with)     [[ $# -ge 2 ]] || die "--with needs an application"; APP_QUERY="$2"; shift 2 ;;
     --with=*)      APP_QUERY="${1#*=}"; shift ;;
@@ -814,7 +817,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$(uname -s)" == "Darwin" ]] || die "this only makes sense on macOS"
-[[ $QUIET -eq 1 ]] && exec 2>/dev/null
 
 # A token may be an actual file; use its extension.
 # The name "open-with" invites "open THIS FILE with that app". It does not do
